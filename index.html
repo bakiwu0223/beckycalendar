@@ -1310,5 +1310,683 @@ refreshOptions();
 render();
 void initPersistence();
 </script>
-</body>
+<!-- becky 月曆無損增補：多選刪除／重複清理／複製卡片 -->
+<style id="becky-card-tools-style">
+.bulk-tools{
+ display:flex;
+ align-items:center;
+ gap:8px;
+ flex-wrap:wrap;
+ margin:14px 0;
+ padding:12px 14px;
+ border:1px solid var(--line);
+ border-radius:10px;
+ background:#fff;
+}
+.bulk-tools button{font-size:12px;padding:8px 10px}
+.bulk-tools .bulk-count{
+ font-size:12px;
+ color:var(--muted);
+ margin-right:auto;
+}
+.bulk-tools button:disabled{
+ cursor:not-allowed;
+ opacity:.5;
+}
+.bulk-select{
+ display:flex;
+ align-items:center;
+ gap:5px;
+ width:fit-content;
+ margin:0 0 7px;
+ font-size:11px;
+ color:#596574;
+ cursor:pointer;
+}
+.bulk-select input{margin:0}
+.card.bulk-selected{
+ outline:2px solid var(--accent);
+ outline-offset:1px;
+}
+.list .card .bulk-select{
+ grid-column:1/-1;
+ margin-bottom:0;
+}
+.bulk-help{
+ flex-basis:100%;
+ font-size:12px;
+ color:var(--muted);
+ line-height:1.7;
+}
+.bulk-dialog-body{
+ padding:18px 22px;
+ line-height:1.8;
+}
+.bulk-dialog-body p{margin:0 0 12px}
+.bulk-dialog-preview{
+ white-space:pre-wrap;
+ overflow-wrap:anywhere;
+ max-height:260px;
+ overflow:auto;
+ padding:12px;
+ border:1px solid var(--line);
+ border-radius:8px;
+ background:#f8fafc;
+ font-size:12px;
+}
+.bulk-dialog-error{
+ margin-top:10px;
+ color:#a83535;
+ white-space:pre-wrap;
+}
+.bulk-copy-field{
+ display:flex;
+ flex-direction:column;
+ gap:6px;
+ color:var(--muted);
+ font-size:12px;
+}
+@media print{
+ .bulk-tools,.bulk-select{display:none!important}
+ .card.bulk-selected{outline:none!important}
+}
+</style>
+
+<script id="becky-card-tools-script">
+"use strict";
+
+(()=>{
+ const PATCH_ID="becky-card-tools-v1";
+ if(document.documentElement.dataset.beckyCardTools===PATCH_ID)return;
+ document.documentElement.dataset.beckyCardTools=PATCH_ID;
+
+ /*
+  * 保留原有匯入規則：
+  * handleImport、readCards、readCSV 均不替換。
+  * 匯入仍為追加，不自動刪除、不覆蓋、不跳過重複卡。
+  *
+  * 所有資料異動沿用原 setDirty()，
+  * 由既有 IndexedDB 流程自動保存。
+  */
+
+ const selectedKeys=new Set();
+ let pendingAction=null;
+ let copySourceKey=null;
+
+ const originalCardNode=cardNode;
+ const originalRender=render;
+
+ function makeButton(text,handler,className=""){
+  const button=el("button",className,text);
+  button.type="button";
+  button.onclick=handler;
+  return button;
+ }
+
+ function findCard(key){
+  return cards.find(card=>card.key===key);
+ }
+
+ function pruneSelection(){
+  const existing=new Set(cards.map(card=>card.key));
+  for(const key of selectedKeys){
+   if(!existing.has(key))selectedKeys.delete(key);
+  }
+ }
+
+ function currentMonthCards(){
+  return cards.filter(card=>
+   card.date.startsWith(currentMonth)&&matches(card)
+  );
+ }
+
+ function updateToolbar(){
+  pruneSelection();
+
+  const count=selectedKeys.size;
+  const monthCards=currentMonthCards();
+
+  countText.textContent=
+   "已選 "+count.toLocaleString()+" 張"+
+   " · 當月符合篩選 "+monthCards.length.toLocaleString()+" 張";
+
+  deleteSelectedButton.disabled=count===0;
+  clearSelectionButton.disabled=count===0;
+  selectMonthButton.disabled=monthCards.length===0;
+  dedupeButton.disabled=cards.length===0;
+ }
+
+ function updateVisibleSelection(){
+  document.querySelectorAll(".bulk-select input").forEach(input=>{
+   const checked=selectedKeys.has(input.dataset.cardKey);
+   input.checked=checked;
+   input.closest(".card")?.classList.toggle(
+    "bulk-selected",checked
+   );
+  });
+  updateToolbar();
+ }
+
+ function describeCard(card){
+  const details=[
+   card.date,
+   card.project,
+   card.type,
+   card.task,
+   card.stage,
+   card.time,
+   card.id?"編號："+card.id:"編號留白"
+  ].filter(Boolean);
+
+  return details.join("｜");
+ }
+
+ /*
+  * 重複判定：
+  * 日期、專案、分類、任務、CUE表編號、時間、階段、說明
+  * 全部相同，才視為重複。
+  *
+  * 編號、匯入來源、本次異動、完成核實不參與判定。
+  * 不做模糊比對，不改寫原欄位內容。
+  * 說明不同的寶石卡與個人IP不會被合併。
+  */
+ function duplicateSignature(card){
+  return JSON.stringify([
+   card.date,
+   card.project,
+   card.type,
+   card.task,
+   card.cue,
+   card.time,
+   card.stage,
+   card.note
+  ].map(value=>String(value??"")));
+ }
+
+ function duplicateGroups(){
+  const groups=new Map();
+
+  for(const card of cards){
+   const signature=duplicateSignature(card);
+   if(!groups.has(signature))groups.set(signature,[]);
+   groups.get(signature).push(card);
+  }
+
+  return [...groups.values()].filter(group=>group.length>1);
+ }
+
+ function duplicateDeleteCount(groups){
+  return groups.reduce((total,group)=>total+group.length-1,0);
+ }
+
+ /*
+  * 沿用既有含資料 HTML 匯出功能。
+  * 這裡只能送出下載，無法確認使用者是否完成存檔。
+  */
+ function backupBeforeDeletion(){
+  try{
+   $("save").click();
+  }catch(error){
+   throw Error(
+    "無法送出刪除前備份下載，已停止刪除。"+
+    (error?.message?"\n"+error.message:"")
+   );
+  }
+ }
+
+ function commitChange(message){
+  setDirty();
+  refreshOptions();
+  render();
+  $("status").textContent=
+   message+"\n自動保存結果請見上方保存狀態。";
+ }
+
+ /* 新增工具列，不改原有按鈕及篩選。 */
+ const toolbar=el("div","bulk-tools");
+ toolbar.id="bulkCardTools";
+ toolbar.setAttribute("aria-label","卡片多選與重複清理");
+
+ const countText=el("span","bulk-count");
+
+ const selectMonthButton=makeButton(
+  "選取當月篩選結果",
+  ()=>{
+   for(const card of currentMonthCards()){
+    selectedKeys.add(card.key);
+   }
+   updateVisibleSelection();
+  }
+ );
+
+ const clearSelectionButton=makeButton(
+  "取消全部選取",
+  ()=>{
+   selectedKeys.clear();
+   updateVisibleSelection();
+  }
+ );
+
+ const deleteSelectedButton=makeButton(
+  "刪除已選卡片",
+  prepareSelectedDeletion,
+  "danger"
+ );
+
+ const dedupeButton=makeButton(
+  "刪除重複卡片",
+  prepareDuplicateDeletion
+ );
+
+ const help=el(
+  "div",
+  "bulk-help",
+  "選取可跨月份保留；「選取當月篩選結果」只選目前月份。"+
+  "匯入仍保留重複卡片；清理重複會檢查全部資料，不受目前篩選限制。"
+ );
+
+ toolbar.append(
+  countText,
+  selectMonthButton,
+  clearSelectionButton,
+  deleteSelectedButton,
+  dedupeButton,
+  help
+ );
+
+ document.querySelector(".monthbar").after(toolbar);
+
+ /* 為原卡片加上獨立選取框，不影響完成核實。 */
+ cardNode=function(card,list=false){
+  const node=originalCardNode(card,list);
+
+  const label=el("label","bulk-select");
+  const checkbox=el("input");
+  checkbox.type="checkbox";
+  checkbox.dataset.cardKey=card.key;
+  checkbox.checked=selectedKeys.has(card.key);
+  checkbox.setAttribute(
+   "aria-label",
+   "選取卡片："+card.date+" "+card.project+" "+card.task
+  );
+
+  checkbox.onchange=()=>{
+   if(checkbox.checked)selectedKeys.add(card.key);
+   else selectedKeys.delete(card.key);
+   updateVisibleSelection();
+  };
+
+  label.append(checkbox,document.createTextNode("選取"));
+  node.prepend(label);
+  node.classList.toggle(
+   "bulk-selected",
+   selectedKeys.has(card.key)
+  );
+
+  return node;
+ };
+
+ render=function(){
+  originalRender();
+  updateToolbar();
+ };
+
+ /* 刪除確認視窗。 */
+ const actionDialog=el("dialog");
+ actionDialog.id="bulkActionDialog";
+ actionDialog.setAttribute("aria-labelledby","bulkActionTitle");
+
+ const actionHead=el("div","modalhead");
+ const actionTitle=el("h2","","確認刪除");
+ actionTitle.id="bulkActionTitle";
+
+ const actionClose=makeButton("✕",()=>actionDialog.close());
+ actionClose.setAttribute("aria-label","關閉");
+
+ actionHead.append(actionTitle,actionClose);
+
+ const actionBody=el("div","bulk-dialog-body");
+ const actionMessage=el("p");
+ const actionPreview=el("div","bulk-dialog-preview");
+ const actionBackupNote=el(
+  "p",
+  "",
+  "確認後會先送出刪除前的含資料 HTML 備份下載，再執行刪除。"+
+  "請保留下載檔；若瀏覽器阻擋下載，請先取消並手動下載備份。"
+ );
+ const actionError=el("div","bulk-dialog-error");
+ actionError.setAttribute("role","alert");
+
+ actionBody.append(
+  actionMessage,
+  actionPreview,
+  actionBackupNote,
+  actionError
+ );
+
+ const actionFoot=el("div","modalfoot");
+ const actionCancel=makeButton("取消",()=>actionDialog.close());
+ const actionConfirm=makeButton(
+  "確認刪除",
+  executePendingAction,
+  "danger"
+ );
+ actionFoot.append(actionCancel,actionConfirm);
+ actionDialog.append(actionHead,actionBody,actionFoot);
+ document.body.append(actionDialog);
+
+ actionDialog.addEventListener("close",()=>{
+  pendingAction=null;
+  actionConfirm.disabled=false;
+  actionError.textContent="";
+ });
+
+ function showAction(title,message,preview,action){
+  pendingAction=action;
+  actionTitle.textContent=title;
+  actionMessage.textContent=message;
+  actionPreview.textContent=preview;
+  actionError.textContent="";
+  actionConfirm.disabled=false;
+  actionDialog.showModal();
+ }
+
+ function prepareSelectedDeletion(){
+  pruneSelection();
+  const selected=cards.filter(card=>selectedKeys.has(card.key));
+  if(!selected.length){
+   updateToolbar();
+   return;
+  }
+
+  const preview=selected.slice(0,30).map(describeCard).join("\n");
+  const remaining=selected.length-30;
+
+  showAction(
+   "刪除已選卡片",
+   "將刪除 "+selected.length.toLocaleString()+
+   " 張卡片，包含跨月份選取的卡片。此操作會自動保存。",
+   preview+(remaining>0
+    ?"\n……另有 "+remaining.toLocaleString()+" 張"
+    :""),
+   {
+    kind:"selected",
+    keys:new Set(selected.map(card=>card.key))
+   }
+  );
+ }
+
+ function prepareDuplicateDeletion(){
+  const groups=duplicateGroups();
+
+  if(!groups.length){
+   $("status").textContent=
+    "沒有找到符合目前判定規則的重複卡片。"+
+    "已比對全部資料，未刪除任何卡片。";
+   return;
+  }
+
+  const removeCount=duplicateDeleteCount(groups);
+
+  const preview=groups.slice(0,20).map((group,index)=>
+   (index+1)+". "+describeCard(group[0])+
+   "\n   共 "+group.length+" 張，保留 1 張、刪除 "+
+   (group.length-1)+" 張"
+  ).join("\n\n");
+
+  showAction(
+   "刪除重複卡片",
+   "全部資料找到 "+groups.length.toLocaleString()+
+   " 組重複，將刪除 "+removeCount.toLocaleString()+
+   " 張。每組保留目前資料順序中的第一張，"+
+   "任一張已核實時，保留卡也設為已核實。"+
+   "被刪除卡片的不同編號與異動紀錄只留在刪除前備份。",
+   preview+(groups.length>20
+    ?"\n\n……另有 "+(groups.length-20).toLocaleString()+" 組"
+    :""),
+   {kind:"duplicates"}
+  );
+ }
+
+ function executePendingAction(){
+  if(!pendingAction)return;
+
+  actionConfirm.disabled=true;
+  actionError.textContent="";
+
+  try{
+   const action=pendingAction;
+
+   if(action.kind==="selected"){
+    const keys=action.keys;
+    const existing=cards.filter(card=>keys.has(card.key));
+
+    if(!existing.length){
+     actionDialog.close();
+     render();
+     return;
+    }
+
+    backupBeforeDeletion();
+
+    cards=cards.filter(card=>!keys.has(card.key));
+    for(const key of keys)selectedKeys.delete(key);
+
+    actionDialog.close();
+    commitChange(
+     "已刪除選取的 "+existing.length.toLocaleString()+
+     " 張卡片，並已送出刪除前 HTML 備份下載。"
+    );
+    return;
+   }
+
+   if(action.kind==="duplicates"){
+    /* 執行時重新計算，避免使用過期的預覽結果。 */
+    const groups=duplicateGroups();
+
+    if(!groups.length){
+     actionDialog.close();
+     $("status").textContent="目前已沒有符合規則的重複卡片。";
+     return;
+    }
+
+    backupBeforeDeletion();
+
+    const removeKeys=new Set();
+
+    for(const group of groups){
+     const keep=group[0];
+
+     /* 核實狀態只向「已核實」合併，避免完成紀錄倒退。 */
+     keep.done=group.some(card=>!!card.done);
+
+     for(const card of group.slice(1)){
+      removeKeys.add(card.key);
+
+      /* 若選取的是被合併卡，選取狀態轉移到保留卡。 */
+      if(selectedKeys.has(card.key)){
+       selectedKeys.add(keep.key);
+      }
+     }
+    }
+
+    cards=cards.filter(card=>!removeKeys.has(card.key));
+    for(const key of removeKeys)selectedKeys.delete(key);
+
+    actionDialog.close();
+    commitChange(
+     "已清理 "+groups.length.toLocaleString()+
+     " 組重複，刪除 "+removeKeys.size.toLocaleString()+
+     " 張；每組保留一張並保留已核實狀態。"+
+     "已送出刪除前 HTML 備份下載。"
+    );
+   }
+  }catch(error){
+   actionError.textContent=error?.message||"操作失敗";
+   actionConfirm.disabled=false;
+  }
+ }
+
+ /* 複製到別天：新增獨立視窗，不改原編輯表單。 */
+ const copyDialog=el("dialog");
+ copyDialog.id="copyCardDialog";
+ copyDialog.setAttribute("aria-labelledby","copyCardTitle");
+
+ const copyHead=el("div","modalhead");
+ const copyTitle=el("h2","","複製卡片到別天");
+ copyTitle.id="copyCardTitle";
+
+ const copyClose=makeButton("✕",()=>copyDialog.close());
+ copyClose.setAttribute("aria-label","關閉");
+
+ copyHead.append(copyTitle,copyClose);
+
+ const copyBody=el("div","bulk-dialog-body");
+ const copySummary=el("p");
+ const copyNotice=el(
+  "p",
+  "",
+  "複製的是已儲存的原卡片，原卡不變。"+
+  "新卡使用新的手動編號，完成核實重設為未核實。"+
+  "如果剛修改原卡，請先儲存，再執行複製。"
+ );
+
+ const copyField=el("label","bulk-copy-field");
+ const copyDateInput=el("input");
+ copyDateInput.type="date";
+ copyDateInput.required=true;
+ copyDateInput.id="copyCardDate";
+ copyField.append(
+  document.createTextNode("複製到日期"),
+  copyDateInput
+ );
+
+ const copyError=el("div","bulk-dialog-error");
+ copyError.setAttribute("role","alert");
+
+ copyBody.append(
+  copySummary,
+  copyNotice,
+  copyField,
+  copyError
+ );
+
+ const copyFoot=el("div","modalfoot");
+ const copyCancel=makeButton("取消",()=>copyDialog.close());
+ const copyConfirm=makeButton(
+  "建立複製卡片",
+  executeCopy,
+  "primary"
+ );
+
+ copyFoot.append(copyCancel,copyConfirm);
+ copyDialog.append(copyHead,copyBody,copyFoot);
+ document.body.append(copyDialog);
+
+ const editorCopyButton=makeButton(
+  "複製到別天",
+  ()=>{
+   const source=findCard(editKey);
+   if(!source)return;
+
+   copySourceKey=source.key;
+   copySummary.textContent=describeCard(source);
+   copyError.textContent="";
+
+   const nextDate=new Date(source.date+"T12:00:00");
+   nextDate.setDate(nextDate.getDate()+1);
+   copyDateInput.value=dateKey(nextDate);
+
+   copyConfirm.disabled=false;
+   copyDialog.showModal();
+  }
+ );
+ editorCopyButton.id="copyToAnotherDay";
+
+ $("delete").after(editorCopyButton);
+
+ /* 由原編輯器標題變動同步按鈕可見性。 */
+ function updateCopyButton(){
+  editorCopyButton.hidden=!editKey||!findCard(editKey);
+ }
+
+ const editorObserver=new MutationObserver(updateCopyButton);
+ editorObserver.observe($("editorTitle"),{
+  childList:true,
+  characterData:true,
+  subtree:true
+ });
+ updateCopyButton();
+
+ copyDialog.addEventListener("close",()=>{
+  copySourceKey=null;
+  copyConfirm.disabled=false;
+ });
+
+ function nextManualId(){
+  const ids=new Set(cards.map(card=>card.id));
+  let number=1;
+  while(ids.has("M"+String(number).padStart(4,"0"))){
+   number++;
+  }
+  return "M"+String(number).padStart(4,"0");
+ }
+
+ function executeCopy(){
+  const source=findCard(copySourceKey);
+  const targetDate=copyDateInput.value;
+
+  if(!source){
+   copyError.textContent="原卡片不存在，請重新開啟卡片。";
+   return;
+  }
+
+  if(!validDate(targetDate)){
+   copyError.textContent="請選擇有效的複製日期。";
+   return;
+  }
+
+  if(targetDate===source.date){
+   copyError.textContent="請選擇與原卡不同的日期。";
+   return;
+  }
+
+  copyConfirm.disabled=true;
+
+  const originalChange=String(source.change??"");
+  const copyRecord=
+   "複製自 "+source.date+
+   (source.id?"（"+source.id+"）":"");
+
+  const copied={
+   ...source,
+   key:uid(),
+   id:nextManualId(),
+   date:targetDate,
+   done:false,
+   change:originalChange
+    ?originalChange+"；"+copyRecord
+    :copyRecord
+  };
+
+  cards.push(copied);
+  currentMonth=targetDate.slice(0,7);
+
+  copyDialog.close();
+  $("editor").close();
+
+  commitChange(
+   "已複製至 "+targetDate+"，新卡編號："+copied.id+
+   "。原卡片未變更；新卡已重設為尚未核實。"+
+   "若目前篩選隱藏新卡，請清除篩選查看。"
+  );
+
+  /* 開啟新卡，方便立即調整任務、時間等欄位。 */
+  openEditor(copied.key);
+ }
+
+ render();
+})();
+</script>
+<!-- becky 月曆無損增補結束 --></body>
 </html>
